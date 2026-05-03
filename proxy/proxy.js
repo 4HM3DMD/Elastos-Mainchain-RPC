@@ -22,6 +22,16 @@
 
 var http = require('http');
 
+// Reuse TCP connections to upstreams. The Elastos.ELA node and the indexer
+// are both local; keep-alive saves ~1ms per call and avoids ephemeral-port
+// exhaustion under load.
+var keepAliveAgent = new http.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    maxSockets: 256,
+    maxFreeSockets: 32
+});
+
 // ─── Config from environment ─────────────────────────────────────────────
 var ELA_HOST           = process.env.ELA_HOST           || '127.0.0.1';
 var ELA_PORT           = parseInt(process.env.ELA_PORT  || '20336', 10);
@@ -35,6 +45,7 @@ var LISTEN_HOST        = process.env.LISTEN_HOST        || '127.0.0.1';
 var LISTEN_PORT        = parseInt(process.env.LISTEN_PORT || '8336', 10);
 
 var MAX_BODY           = parseInt(process.env.MAX_BODY           || '65536', 10);
+var MAX_BATCH          = parseInt(process.env.MAX_BATCH          || '64',    10);
 var UPSTREAM_TIMEOUT   = parseInt(process.env.UPSTREAM_TIMEOUT   || '30000', 10);
 var HEIGHT_POLL_MS     = parseInt(process.env.HEIGHT_POLL_MS     || '3000', 10);
 
@@ -158,13 +169,20 @@ function applyTransform(method, respObj) {
     }
 }
 
+// The ELA node accepts method names case-insensitively (Go's net/rpc style),
+// so we must normalize before any routing decision. Otherwise a client can
+// trivially bypass BLOCKED (e.g. `Togglemining`) or skip transformers
+// (e.g. `getCRrelatedstage`).
+function normalizeMethod(method) {
+    return typeof method === 'string' ? method.toLowerCase() : '';
+}
+
 // ─── HTTP plumbing ───────────────────────────────────────────────────────
 function jsonError(res, id, code, message, status) {
-    res.writeHead(status, {
+    safeWrite(res, status, {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*'
-    });
-    res.end(JSON.stringify({
+    }, JSON.stringify({
         id: id,
         jsonrpc: '2.0',
         error: { code: code, message: message },
@@ -192,6 +210,7 @@ function forwardRequest(hostname, port, body, auth, timeout, callback) {
     }
 
     var proxyReq = http.request({
+        agent: keepAliveAgent,
         hostname: hostname,
         port: port,
         path: '/',
@@ -232,7 +251,7 @@ function forwardRequest(hostname, port, body, auth, timeout, callback) {
 }
 
 function isMethodAllowed(method) {
-    if (typeof method !== 'string') return false;
+    if (typeof method !== 'string' || method.length === 0) return false;
     return !BLOCKED.has(method);
 }
 
@@ -243,15 +262,32 @@ function pickTarget(method) {
     return { host: ELA_HOST, port: ELA_PORT, auth: AUTH, name: 'node' };
 }
 
+// True if writing to `res` would throw. Long upstream calls + client hangup
+// is the most common cause; without this guard the upstream callback can
+// fire after the client socket is gone, crashing the worker.
+function resWritable(res) {
+    return res && !res.writableEnded && !res.destroyed;
+}
+
+function safeWrite(res, status, headers, body) {
+    if (!resWritable(res)) return;
+    try {
+        res.writeHead(status, headers);
+        res.end(body);
+    } catch (e) {
+        // Headers were already sent or socket closed mid-write — nothing
+        // we can do, but don't propagate to crash the process.
+    }
+}
+
 // ─── Server ──────────────────────────────────────────────────────────────
 var server = http.createServer(function (req, res) {
     if (req.method === 'OPTIONS') {
-        res.writeHead(204, {
+        safeWrite(res, 204, {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'POST, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type'
-        });
-        res.end();
+        }, '');
         return;
     }
 
@@ -260,47 +296,61 @@ var server = http.createServer(function (req, res) {
         return;
     }
 
+    // The client request can fail via oversize-body, parse error, transport
+    // error, or end-of-stream. Each path must respond at most once.
+    var handled = false;
+    function reply(fn) {
+        if (handled) return;
+        handled = true;
+        fn();
+    }
+
     var chunks = [];
     var size = 0;
 
     req.on('data', function (chunk) {
+        if (handled) return;
         size += chunk.length;
         if (size > MAX_BODY) {
             req.destroy();
-            jsonError(res, null, -32600, 'Request body too large', 413);
+            reply(function () { jsonError(res, null, -32600, 'Request body too large', 413); });
             return;
         }
         chunks.push(chunk);
     });
 
     req.on('end', function () {
+        if (handled) return;
         var raw = Buffer.concat(chunks).toString('utf8');
         var parsed;
 
         try {
             parsed = JSON.parse(raw);
         } catch (e) {
-            jsonError(res, null, -32700, 'Parse error', 400);
+            reply(function () { jsonError(res, null, -32700, 'Parse error', 400); });
             return;
         }
 
-        // Batch
+        // Mark as handled so subsequent error events don't double-respond.
+        // The actual response is written by handleSingle / handleBatch, both
+        // of which use safeWrite() and short-circuit if the client hung up.
+        handled = true;
+
         if (Array.isArray(parsed)) {
             handleBatch(parsed, res);
             return;
         }
-
         handleSingle(parsed, res);
     });
 
     req.on('error', function () {
-        jsonError(res, null, -32603, 'Request error', 400);
+        reply(function () { jsonError(res, null, -32603, 'Request error', 400); });
     });
 });
 
 function handleSingle(reqObj, res) {
     var id = reqObj && reqObj.id !== undefined ? reqObj.id : null;
-    var method = reqObj && reqObj.method;
+    var method = normalizeMethod(reqObj && reqObj.method);
 
     if (!isMethodAllowed(method)) {
         jsonError(res, id, -32601, 'Method not allowed', 200);
@@ -308,9 +358,13 @@ function handleSingle(reqObj, res) {
     }
 
     var target = pickTarget(method);
+    // Forward the original method casing — ELA accepts both, so we keep the
+    // wire bytes identical to what the client sent for everything except the
+    // routing decision.
     var body = JSON.stringify(reqObj);
 
     forwardRequest(target.host, target.port, body, target.auth, UPSTREAM_TIMEOUT, function (err, status, upstreamBody) {
+        if (!resWritable(res)) return;
         if (err) {
             jsonError(res, id, -32603, 'Upstream error: ' + err.message, 502);
             return;
@@ -323,15 +377,14 @@ function handleSingle(reqObj, res) {
                 applyTransform(method, respObj);
                 transformed = JSON.stringify(respObj);
             } catch (e) {
-                // keep upstream body as-is
+                // upstream gave non-JSON or oddly-typed; pass through verbatim
             }
         }
 
-        res.writeHead(status || 200, {
+        safeWrite(res, status || 200, {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*'
-        });
-        res.end(transformed);
+        }, transformed);
     });
 }
 
@@ -340,21 +393,25 @@ function handleBatch(arr, res) {
         jsonError(res, null, -32600, 'Empty batch', 400);
         return;
     }
+    if (arr.length > MAX_BATCH) {
+        jsonError(res, null, -32600,
+            'Batch too large (max ' + MAX_BATCH + ' items)', 413);
+        return;
+    }
 
     var responses = new Array(arr.length);
     var pending = arr.length;
 
     function done() {
-        res.writeHead(200, {
+        safeWrite(res, 200, {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*'
-        });
-        res.end(JSON.stringify(responses));
+        }, JSON.stringify(responses));
     }
 
     arr.forEach(function (reqObj, idx) {
         var id = reqObj && reqObj.id !== undefined ? reqObj.id : null;
-        var method = reqObj && reqObj.method;
+        var method = normalizeMethod(reqObj && reqObj.method);
 
         if (!isMethodAllowed(method)) {
             responses[idx] = {
@@ -396,12 +453,39 @@ function handleBatch(arr, res) {
     });
 }
 
+// ─── Process-level safety net ────────────────────────────────────────────
+// A stray throw inside any HTTP event listener should not take the proxy
+// down. systemd will restart on real fatal errors; we just want to log and
+// keep serving the next request.
+process.on('uncaughtException', function (err) {
+    console.error('uncaughtException:', (err && err.stack) || err);
+});
+process.on('unhandledRejection', function (reason) {
+    console.error('unhandledRejection:', reason);
+});
+
 // ─── Boot ────────────────────────────────────────────────────────────────
 pollHeight();
-setInterval(pollHeight, HEIGHT_POLL_MS);
+var heightPoller = setInterval(pollHeight, HEIGHT_POLL_MS);
 
 server.listen(LISTEN_PORT, LISTEN_HOST, function () {
     console.log('ELA RPC proxy listening on ' + LISTEN_HOST + ':' + LISTEN_PORT);
     console.log('  → ELA node     : ' + ELA_HOST + ':' + ELA_PORT);
     console.log('  → Indexer      : ' + INDEXER_HOST + ':' + INDEXER_PORT);
+    console.log('  → Max body     : ' + MAX_BODY + ' bytes');
+    console.log('  → Max batch    : ' + MAX_BATCH + ' items');
 });
+
+// Graceful shutdown: stop accepting new connections and let in-flight
+// requests finish (up to UPSTREAM_TIMEOUT). systemd sends SIGTERM on
+// `systemctl stop` / `systemctl restart`.
+function shutdown(signal) {
+    console.log('received ' + signal + ', shutting down');
+    clearInterval(heightPoller);
+    server.close(function () {
+        process.exit(0);
+    });
+    setTimeout(function () { process.exit(1); }, UPSTREAM_TIMEOUT + 1000).unref();
+}
+process.on('SIGTERM', function () { shutdown('SIGTERM'); });
+process.on('SIGINT',  function () { shutdown('SIGINT'); });
