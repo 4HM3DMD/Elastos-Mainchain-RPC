@@ -181,6 +181,16 @@ function forwardRequest(hostname, port, body, auth, timeout, callback) {
         headers['Authorization'] = 'Basic ' + auth;
     }
 
+    // Guard against multi-fire: the request can complete via end, error,
+    // timeout, or oversize-body. Each path must invoke `callback` at most
+    // once, even if the underlying socket fires later events after destroy().
+    var done = false;
+    function finish(err, status, bodyStr) {
+        if (done) return;
+        done = true;
+        callback(err, status, bodyStr);
+    }
+
     var proxyReq = http.request({
         hostname: hostname,
         port: port,
@@ -192,24 +202,29 @@ function forwardRequest(hostname, port, body, auth, timeout, callback) {
         var chunks = [];
         var total = 0;
         proxyRes.on('data', function (chunk) {
+            if (done) return;
             chunks.push(chunk);
             total += chunk.length;
             if (total > MAX_BODY * 16) {
+                proxyRes.destroy();
                 proxyReq.destroy();
-                callback(new Error('upstream response too large'));
+                finish(new Error('upstream response too large'));
             }
         });
         proxyRes.on('end', function () {
-            callback(null, proxyRes.statusCode, Buffer.concat(chunks).toString('utf8'));
+            finish(null, proxyRes.statusCode, Buffer.concat(chunks).toString('utf8'));
+        });
+        proxyRes.on('error', function (err) {
+            finish(err);
         });
     });
 
     proxyReq.on('error', function (err) {
-        callback(err);
+        finish(err);
     });
     proxyReq.on('timeout', function () {
         proxyReq.destroy();
-        callback(new Error('upstream timeout'));
+        finish(new Error('upstream timeout'));
     });
 
     proxyReq.write(body);
