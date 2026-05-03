@@ -1,0 +1,32 @@
+[Unit]
+Description=Elastos Main-chain Go Indexer
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ela-indexer
+Group=ela-indexer
+WorkingDirectory=/opt/ela-indexer
+EnvironmentFile=/opt/ela-indexer/.env
+ExecStart=/opt/ela-indexer/bin/indexer
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ela-indexer
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ela-indexer
+
+[Install]
+WantedBy=multi-user.target

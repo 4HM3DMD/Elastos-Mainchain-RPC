@@ -1,0 +1,33 @@
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.env
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Go build artifacts
+indexer/bin/
+indexer/indexer
+*.test
+*.out
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs / runtime
+*.log
+proxy.log
+*.pid
+
+# Backups
+backups/
+*.sql.gz
+.alert_state

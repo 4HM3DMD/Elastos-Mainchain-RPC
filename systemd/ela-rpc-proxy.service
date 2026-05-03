@@ -1,0 +1,31 @@
+[Unit]
+Description=Elastos Main-chain RPC Proxy
+After=network-online.target ela-indexer.service
+Wants=network-online.target ela-indexer.service
+
+[Service]
+Type=simple
+User=ela-proxy
+Group=ela-proxy
+WorkingDirectory=/opt/ela-rpc-proxy
+EnvironmentFile=/opt/ela-rpc-proxy/.env
+ExecStart=/usr/bin/node /opt/ela-rpc-proxy/proxy.js
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ela-rpc-proxy
+
+[Install]
+WantedBy=multi-user.target
